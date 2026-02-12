@@ -1,29 +1,52 @@
 import React, {
   createContext,
+  useCallback,
   useEffect,
   useMemo,
-  useReducer,
   useRef,
+  useState,
 } from 'react';
-import {
-  NativeEventEmitter,
-  NativeModules,
-  PermissionsAndroid,
-  Platform,
-} from 'react-native';
-import BleManager from 'react-native-ble-manager';
-import { throttle } from 'lodash';
-import {
-  bleReducer,
-  initialBleState,
-  type BleConnectedDevice,
-  type BleService,
-  type BleState,
+import BleManager, {
+  BleDisconnectPeripheralEvent,
+  BleScanCallbackType,
+  BleScanMatchMode,
+  BleScanMode,
+  type Peripheral,
+  type PeripheralInfo,
+} from 'react-native-ble-manager';
+import type {
+  BleConnectedDevice,
+  BleConnectionStatus,
+  BleService,
 } from './bleReducer';
+import {
+  buildServicesFromPeripheralInfo,
+  ensureBluetoothReadyForScan,
+  peripheralToDevice,
+  requestBluetoothPermissions,
+} from './bleUtils';
 
-type BleContextValue = BleState & {
-  scan: () => Promise<void>;
+const SERVICE_UUIDS: string[] = [];
+const THROTTLE_MS = 300;
+
+// Extend the library's Peripheral type with our UI flags (connected/connecting).
+declare module 'react-native-ble-manager' {
+  interface Peripheral {
+    connected?: boolean;
+    connecting?: boolean;
+  }
+}
+
+export type BleContextValue = {
+  isScanning: boolean;
+  discoveredDevices: BleConnectedDevice[];
+  connectionStatus: BleConnectionStatus;
+  connectedDevice: BleConnectedDevice | undefined;
+  services: BleService[];
+  lastError: string | undefined;
+  scan: () => void;
   stopScan: () => Promise<void>;
+  sortBySignal: () => void;
   connect: (deviceId: string) => Promise<void>;
   disconnect: () => Promise<void>;
   refreshServices: () => Promise<void>;
@@ -31,249 +54,296 @@ type BleContextValue = BleState & {
 
 export const BleContext = createContext<BleContextValue | null>(null);
 
-type BlePeripheralLike = {
-  id: string;
-  name?: string;
-  rssi?: number;
-  advertising?: unknown;
-};
-
-type RetrieveServicesResult = {
-  id: string;
-  name?: string;
-  rssi?: number;
-  services?: string[];
-  characteristics?: Array<{
-    characteristic: string;
-    service: string;
-    properties?: Record<string, string>;
-  }>;
-};
-
-async function requestAndroidBlePermissions() {
-  if (Platform.OS !== 'android') return;
-
-  // Android 12+ requires runtime permissions for scan/connect.
-  const perms: string[] = [];
-  if (Platform.Version >= 31) {
-    perms.push(
-      PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-    );
-  } else {
-    // Pre-Android 12: location is required for scanning.
-    perms.push(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
-  }
-
-  await PermissionsAndroid.requestMultiple(perms);
-}
-
-function toConnectedDevice(p: BlePeripheralLike): BleConnectedDevice {
-  return { id: p.id, name: p.name, rssi: p.rssi };
-}
-
-function buildServices(result: RetrieveServicesResult): BleService[] {
-  const services = result.services ?? [];
-  const chars = result.characteristics ?? [];
-
-  const byService = new Map<string, BleService>();
-  for (const svc of services) {
-    byService.set(svc, { uuid: svc, characteristics: [] });
-  }
-
-  for (const c of chars) {
-    const svcUuid = c.service;
-    const existing = byService.get(svcUuid) ?? {
-      uuid: svcUuid,
-      characteristics: [],
-    };
-    existing.characteristics.push({
-      characteristic: c.characteristic,
-      service: c.service,
-      properties: c.properties as any,
-    });
-    byService.set(svcUuid, existing);
-  }
-
-  return Array.from(byService.values()).sort((a, b) =>
-    a.uuid.localeCompare(b.uuid),
-  );
-}
-
 export function BleProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(bleReducer, initialBleState);
+  const [isScanning, setIsScanning] = useState(false);
+  const [peripherals, setPeripherals] = useState<Peripheral[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<Peripheral | null>(null);
+  const [deviceServices, setDeviceServices] = useState<PeripheralInfo | null>(
+    null,
+  );
+  const [lastError, setLastError] = useState<string | undefined>(undefined);
 
-  // Use Map for discovery performance (requirement).
-  const discoveredMapRef = useRef<Map<string, BlePeripheralLike>>(new Map());
+  const peripheralsMapRef = useRef<Map<Peripheral['id'], Peripheral>>(
+    new Map(),
+  );
+  const throttleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const sortByRssiRef = useRef(false);
+  const connectingToIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedDevice?.id ?? null;
 
-  // Only allow one connected device at a time.
-  const connectedIdRef = useRef<string | undefined>(undefined);
+  // update actual list of peripherals used on screen
+  const updatePeripheralsList = useCallback(() => {
+    let list = Array.from(peripheralsMapRef.current.values());
+    if (sortByRssiRef.current) {
+      list = [...list].sort((a, b) => (b.rssi ?? -100) - (a.rssi ?? -100));
+    }
+    setPeripherals(list);
+  }, []);
 
-  const updateFlashListDataThrottled = useMemo(
-    () =>
-      throttle(() => {
-        const arr = Array.from(discoveredMapRef.current.values())
-          .map(toConnectedDevice)
-          .sort((a, b) => {
-            const ar = a.rssi ?? -999;
-            const br = b.rssi ?? -999;
-            return br - ar;
-          });
-        dispatch({ type: 'SET_DISCOVERED_DEVICES', devices: arr });
-      }, 250),
-    [],
+  // throttle list updates so we don't setState on every discovery
+  const scheduleListUpdate = useCallback(() => {
+    if (throttleRef.current !== null) return;
+    throttleRef.current = setTimeout(() => {
+      updatePeripheralsList();
+      throttleRef.current = null;
+    }, THROTTLE_MS);
+  }, [updatePeripheralsList]);
+
+  const onDiscover = useCallback(
+    (peripheral: Peripheral) => {
+      if (!peripheral?.id) return;
+      const map = peripheralsMapRef.current;
+      const existing = map.get(peripheral.id);
+      const merged: Peripheral = {
+        ...(existing ?? {}),
+        ...peripheral,
+        name: peripheral.name ?? existing?.name ?? peripheral.id,
+      };
+      map.set(peripheral.id, merged);
+      if (map.size === 1) {
+        updatePeripheralsList();
+      } else {
+        scheduleListUpdate();
+      }
+    },
+    [scheduleListUpdate, updatePeripheralsList],
+  );
+
+  const onStopScan = useCallback(() => setIsScanning(false), []);
+
+  const onDisconnect = useCallback(
+    (event: BleDisconnectPeripheralEvent) => {
+      const id = event.peripheral;
+      const p = peripheralsMapRef.current.get(id);
+      if (p) {
+        peripheralsMapRef.current.set(id, {
+          ...p,
+          connected: false,
+          connecting: false,
+        });
+        scheduleListUpdate();
+      }
+      if (selectedIdRef.current === id) {
+        setSelectedDevice(null);
+        setDeviceServices(null);
+      }
+    },
+    [scheduleListUpdate],
   );
 
   useEffect(() => {
-    BleManager.start({ showAlert: false }).catch(() => {
-      // ignore; some platforms might throw if already started
-    });
+    BleManager.start({ showAlert: false }).catch(() => {});
 
-    const bleModule = NativeModules.BleManager;
-    const emitter = new NativeEventEmitter(bleModule);
+    const subs = [
+      BleManager.onDiscoverPeripheral(onDiscover),
+      BleManager.onStopScan(onStopScan),
+      BleManager.onDisconnectPeripheral(onDisconnect),
+    ];
 
-    const subDiscover = emitter.addListener(
-      'BleManagerDiscoverPeripheral',
-      (peripheral: BlePeripheralLike) => {
-        if (!peripheral?.id) return;
-        discoveredMapRef.current.set(peripheral.id, peripheral);
-        updateFlashListDataThrottled();
-      },
-    );
-
-    const subStop = emitter.addListener('BleManagerStopScan', () => {
-      dispatch({ type: 'SCAN_STOP' });
-    });
-
-    const subDisconnect = emitter.addListener(
-      'BleManagerDisconnectPeripheral',
-      ({ peripheral }: { peripheral: string }) => {
-        if (connectedIdRef.current === peripheral) {
-          connectedIdRef.current = undefined;
-          dispatch({
-            type: 'CONNECTION_STATUS',
-            status: 'disconnected',
-            device: undefined,
-          });
-        }
-      },
-    );
+    requestBluetoothPermissions();
 
     return () => {
-      subDiscover.remove();
-      subStop.remove();
-      subDisconnect.remove();
-      updateFlashListDataThrottled.cancel();
+      subs.forEach(s => s.remove());
+      if (throttleRef.current) clearTimeout(throttleRef.current);
     };
-  }, [updateFlashListDataThrottled]);
+  }, [onDiscover, onStopScan, onDisconnect]);
 
-  const scan = async () => {
-    try {
-      await requestAndroidBlePermissions();
-      discoveredMapRef.current.clear();
-      dispatch({ type: 'SET_DISCOVERED_DEVICES', devices: [] });
-      dispatch({ type: 'SCAN_START' });
+  const scan = useCallback(() => {
+    if (isScanning) return;
+    setLastError(undefined);
+    sortByRssiRef.current = false;
+    peripheralsMapRef.current.clear();
+    setPeripherals([]);
+    setIsScanning(true);
 
-      // allowDuplicates: true so RSSI updates can come in; list updates are throttled.
-      await BleManager.scan([], 10, true);
-    } catch (e: any) {
-      dispatch({ type: 'SCAN_STOP' });
-      dispatch({
-        type: 'ERROR',
-        message: e?.message ?? 'Failed to start scan',
+    requestBluetoothPermissions().then(async granted => {
+      if (!granted) {
+        setIsScanning(false);
+        setLastError('Bluetooth permissions denied');
+        return;
+      }
+      const bt = await ensureBluetoothReadyForScan();
+      if (!bt.ready) {
+        setIsScanning(false);
+        setLastError(bt.message);
+        return;
+      }
+      BleManager.scan({
+        serviceUUIDs: SERVICE_UUIDS,
+        allowDuplicates: true,
+        matchMode: BleScanMatchMode.Sticky,
+        scanMode: BleScanMode.LowLatency,
+        callbackType: BleScanCallbackType.AllMatches,
+      }).catch((err: unknown) => {
+        setIsScanning(false);
+        setLastError(err instanceof Error ? err.message : 'Scan failed');
       });
-    }
-  };
+    });
+  }, [isScanning]);
 
-  const stopScan = async () => {
+  const stopScan = useCallback(async () => {
     try {
       await BleManager.stopScan();
-      dispatch({ type: 'SCAN_STOP' });
+      setIsScanning(false);
     } catch {
-      dispatch({ type: 'SCAN_STOP' });
+      setIsScanning(false);
     }
-  };
+  }, []);
 
-  const disconnect = async () => {
-    const current = connectedIdRef.current;
-    if (!current) return;
-    try {
-      await BleManager.disconnect(current);
-    } catch {
-      // ignore
-    } finally {
-      connectedIdRef.current = undefined;
-      dispatch({
-        type: 'CONNECTION_STATUS',
-        status: 'disconnected',
-        device: undefined,
-      });
-    }
-  };
+  const sortBySignal = useCallback(() => {
+    sortByRssiRef.current = true;
+    setPeripherals(prev =>
+      [...prev].sort((a, b) => (b.rssi ?? -100) - (a.rssi ?? -100)),
+    );
+  }, []);
 
-  const refreshServices = async () => {
-    const id = connectedIdRef.current;
-    if (!id) return;
-    try {
-      const result = (await BleManager.retrieveServices(
-        id,
-      )) as RetrieveServicesResult;
-      const services = buildServices(result);
-      dispatch({ type: 'SET_SERVICES', services });
-    } catch (e: any) {
-      dispatch({
-        type: 'ERROR',
-        message: e?.message ?? 'Failed to retrieve services',
-      });
-    }
-  };
+  const connect = useCallback(
+    async (deviceId: string) => {
+      setLastError(undefined);
 
-  const connect = async (deviceId: string) => {
-    try {
-      // If user connects to another device -> disconnect the first.
-      if (connectedIdRef.current && connectedIdRef.current !== deviceId) {
-        await BleManager.disconnect(connectedIdRef.current).catch(() => {});
+      // keep track of current connecting device to prevent overlapping connect attempts
+      if (connectingToIdRef.current !== null) return;
+
+      const peripheral = peripheralsMapRef.current.get(deviceId) ?? {
+        id: deviceId,
+        rssi: -100,
+        name: deviceId,
+        advertising: {},
+      };
+
+      // disconnect if already have a connceted device
+      const connected = Array.from(peripheralsMapRef.current.values()).filter(
+        p => p.connected && p.id !== deviceId,
+      );
+      for (const p of connected) {
+        try {
+          await BleManager.disconnect(p.id);
+        } catch {
+          // ignore
+        }
       }
 
-      connectedIdRef.current = deviceId;
-      const discovered = discoveredMapRef.current.get(deviceId);
-      dispatch({
-        type: 'CONNECTION_STATUS',
-        status: 'connecting',
-        device: discovered ? toConnectedDevice(discovered) : { id: deviceId },
-      });
+      // stop scanning before connecting
+      try {
+        await BleManager.stopScan();
+        setIsScanning(false);
+      } catch {
+        // ignore
+      }
 
-      await requestAndroidBlePermissions();
-      await BleManager.connect(deviceId);
-
-      dispatch({
-        type: 'CONNECTION_STATUS',
-        status: 'connected',
-        device: discovered ? toConnectedDevice(discovered) : { id: deviceId },
+      connectingToIdRef.current = deviceId;
+      peripheralsMapRef.current.set(deviceId, {
+        ...peripheral,
+        connecting: true,
       });
+      scheduleListUpdate();
+      setSelectedDevice({ ...peripheral, connecting: true });
 
-      await refreshServices();
-    } catch (e: any) {
-      connectedIdRef.current = undefined;
-      dispatch({
-        type: 'CONNECTION_STATUS',
-        status: 'disconnected',
-        device: undefined,
-      });
-      dispatch({ type: 'ERROR', message: e?.message ?? 'Failed to connect' });
+      try {
+        await BleManager.connect(peripheral.id);
+        peripheralsMapRef.current.set(deviceId, {
+          ...peripheral,
+          connecting: false,
+          connected: true,
+        });
+        scheduleListUpdate();
+
+        await new Promise<void>(r => setTimeout(r, 400));
+
+        const info = await BleManager.retrieveServices(peripheral.id);
+        // avoid wrong update (user changed device while connecting)
+        if (selectedIdRef.current !== deviceId) return;
+        setSelectedDevice({ ...peripheral, connected: true });
+        setDeviceServices(info);
+      } catch (err) {
+        peripheralsMapRef.current.set(deviceId, {
+          ...peripheral,
+          connecting: false,
+          connected: false,
+        });
+        scheduleListUpdate();
+        setSelectedDevice(null);
+        setLastError(err instanceof Error ? err.message : 'Connection failed');
+      } finally {
+        connectingToIdRef.current = null;
+      }
+    },
+    [scheduleListUpdate],
+  );
+
+  const disconnect = useCallback(async () => {
+    if (!selectedDevice) return;
+    try {
+      await BleManager.disconnect(selectedDevice.id);
+    } catch {
+      // ignore
     }
-  };
+    const p = peripheralsMapRef.current.get(selectedDevice.id);
+    if (p) {
+      peripheralsMapRef.current.set(selectedDevice.id, {
+        ...p,
+        connected: false,
+      });
+      scheduleListUpdate();
+    }
+    setSelectedDevice(null);
+    setDeviceServices(null);
+  }, [selectedDevice, scheduleListUpdate]);
+
+  //refetch services for active device
+  const refreshServices = useCallback(async () => {
+    if (!selectedDevice) return;
+    try {
+      const info = await BleManager.retrieveServices(selectedDevice.id);
+      setDeviceServices(info);
+    } catch (err) {
+      setLastError(err instanceof Error ? err.message : 'Refresh failed');
+    }
+  }, [selectedDevice]);
+
+  const connectionStatus: BleConnectionStatus = selectedDevice?.connecting
+    ? 'connecting'
+    : selectedDevice?.connected
+    ? 'connected'
+    : 'disconnected';
+
+  const services = useMemo(
+    () => buildServicesFromPeripheralInfo(deviceServices),
+    [deviceServices],
+  );
 
   const value: BleContextValue = useMemo(
     () => ({
-      ...state,
+      isScanning,
+      discoveredDevices: peripherals.map(peripheralToDevice),
+      connectionStatus,
+      connectedDevice: selectedDevice
+        ? peripheralToDevice(selectedDevice)
+        : undefined,
+      services,
+      lastError,
       scan,
       stopScan,
+      sortBySignal,
       connect,
       disconnect,
       refreshServices,
     }),
-    [state],
+    [
+      isScanning,
+      peripherals,
+      connectionStatus,
+      selectedDevice,
+      services,
+      lastError,
+      scan,
+      stopScan,
+      sortBySignal,
+      connect,
+      disconnect,
+      refreshServices,
+    ],
   );
 
   return <BleContext.Provider value={value}>{children}</BleContext.Provider>;

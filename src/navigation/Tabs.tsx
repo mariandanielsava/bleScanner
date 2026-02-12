@@ -1,5 +1,6 @@
 import React from 'react';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import Icon from '@react-native-vector-icons/fontawesome6';
 import { ScannerScreen } from '../screens/ScannerScreen';
 import { DeviceScreen } from '../screens/DeviceScreen';
 
@@ -17,8 +18,34 @@ export function Tabs() {
         headerShown: false,
       }}
     >
-      <Tab.Screen name="Scanner" component={ScannerScreen} />
-      <Tab.Screen name="Device" component={DeviceScreen} />
+      <Tab.Screen
+        name="Scanner"
+        component={ScannerScreen}
+        options={{
+          tabBarIcon: ({ color, size }) => (
+            <Icon
+              iconStyle="solid"
+              name="satellite-dish"
+              color={color}
+              size={size}
+            />
+          ),
+        }}
+      />
+      <Tab.Screen
+        name="Device"
+        component={DeviceScreen}
+        options={{
+          tabBarIcon: ({ color, size }) => (
+            <Icon
+              iconStyle="solid"
+              name="microchip"
+              color={color}
+              size={size}
+            />
+          ),
+        }}
+      />
     </Tab.Navigator>
   );
 }

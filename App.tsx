@@ -7,7 +7,7 @@ import { Tabs } from './src/navigation/Tabs';
 function App() {
   return (
     <SafeAreaProvider>
-      <StatusBar barStyle={'light-content'} />
+      <StatusBar barStyle={'dark-content'} />
       <NavigationContainer>
         <BleProvider>
           <Tabs />
